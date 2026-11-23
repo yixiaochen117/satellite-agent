@@ -15,6 +15,7 @@ cropcls/
   predict.py   对一批 GeoTIFF 输出预测 CSV
   download.py  预下载数据集与权重
   prepare_pastis.py  PASTIS（法国作物类型）→ 地块 patch
+  cv.py        官方 5 折交叉验证（合并混淆矩阵算 OA / mIoU）
 tests/         合成数据的快速 CPU 测试
 ```
 
@@ -136,34 +137,51 @@ pytest -q    # 合成 GeoTIFF，CPU 上几秒跑完，不需要下载
 ## 7. 欧洲作物类型：PASTIS（法国，18 种作物）
 
 [PASTIS](https://github.com/VSainteuf/pastis-benchmark) 是法国 4 个 Sentinel-2 瓦片上的
-2,433 个 128×128 时序块（2018-09 到 2019-11，每块 33–61 个日期，L2A 10 波段），
+2,433 个 128×128 时序块（2018-09 到 2019-10，每块 38–61 个日期，L2A 10 波段），
 约 12.4 万个地块有作物类型标签：草地、软冬小麦、玉米、冬大麦、冬油菜、春大麦、向日葵、
 葡萄、甜菜、冬黑小麦、冬硬粒小麦、果蔬花卉、马铃薯、豆科饲草、大豆、果园、混合谷物、高粱。
-官方 5 折是空间上分开的，默认 fold 1–3 训练、4 验证、5 测试。
+和官方一致，背景（0）和 void（19，大部分落在瓦片外的地块）不参与，剩下 18 类。
 
 ```bash
 # 1) 下载并解压 PASTIS（只要 S2 部分，约 29 GB）
 #    https://zenodo.org/records/5012942  ->  data/PASTIS/
-# 2) 每个地块切一个 32×32（320 m）的 patch，地块外像素置 0
-python -m cropcls.prepare_pastis --root data/PASTIS --out data/pastis_parcels --composite monthly
-# 3) 训练（波段、时间步数自动从 data/pastis_parcels/cropcls_meta.json 读取）
-python -m cropcls.train --dataset folder --data-root data/pastis_parcels --class-weights --name pastis-monthly
+# 2) 每个地块切一个 32×32（320 m）的 patch，地块外像素置 0，按官方 fold 存到 fold1..fold5/
+python -m cropcls.prepare_pastis --root data/PASTIS --out data/pastis_parcels
+# 3a) 单次训练：官方第 1 轮划分（train 1,2,3 / val 4 / test 5）
+python -m cropcls.train --dataset folder --data-root data/pastis_parcels --class-weights --name pastis-f1
+# 3b) 官方协议：5 轮交叉验证，合并 5 个 test fold 的混淆矩阵算 OA / mIoU
+python -m cropcls.cv --data-root data/pastis_parcels --name pastis-cv -- --class-weights
 ```
 
 两种合成方式：
 
 | `--composite` | 输出 | 模型 |
 |---|---|---|
-| `monthly`（默认） | 2019-03 到 2019-10 每月一个中值合成，8 个时间步 × 10 波段 | 时序模型：每个时间步共享同一个 ResNet-18（预训练权重），再接 2 层小 Transformer 做时间聚合，共约 12.4M 参数 |
-| `median` | 整个生长季一个中值合成，10 波段 | 普通 ResNet-18 |
+| `monthly`（默认） | 2018-09 到 2019-10 每月一个中值合成，14 个时间步 × 10 波段 | 时序模型：每个时间步共享同一个 ResNet-18（预训练权重），再接 2 层小 Transformer 做时间聚合，共约 12.4M 参数 |
+| `median` | 整个时间范围一个中值合成，10 波段 | 普通 ResNet-18 |
 
-作物类型主要靠物候区分（冬小麦和冬大麦单看一景几乎一样），所以优先用 `monthly`。
+默认时间范围覆盖整个 PASTIS 序列，这样能看到冬小麦、冬大麦、冬油菜秋季播种出苗的信号；
+冬小麦和冬大麦单看一景几乎一样，所以优先用 `monthly`。
 时间范围用 `--start/--end` 调整，地块 patch 大小用 `--patch-size`，
 `--no-mask-outside` 可以保留地块周边像素。时序模型默认 `--img-size 64`，
 在 5070 上 `--batch-size 64` 显存很宽裕，可以往上加。
 
-PASTIS 的类别很不均衡（草地和小麦占大多数），建议开 `--class-weights`，
-并以 test 集 macro-F1 / 平衡精度为主要指标，而不是总体精度。
+### 和官方基准怎么比
+
+PASTIS 官方有三个任务，只有“地块分类”和我们做的是同一件事：
+
+| 任务 | 官方指标 | S2 参考成绩 | 能否和本流程直接比 |
+|---|---|---|---|
+| 地块分类（已知地块边界，18 类） | 5 折合并后的 OA、mIoU | PSE+LTAE：OA 91.7%，mIoU 73.9%（[PASTIS-R 论文](https://arxiv.org/abs/2112.07558) 表 1） | **可以**，用 `cropcls.cv` |
+| 语义分割（逐像素，19 类含背景） | 像素级 OA、mIoU | U-TAE：OA 83.2%，mIoU 63.1% | 不行，任务不同 |
+| 全景分割 | SQ / RQ / PQ | U-TAE+PaPs：PQ 43.8 | 不行，任务不同 |
+
+和官方的差异：官方用每块全部 38–61 个日期 + 按天数的位置编码，并对每个波段做标准化；
+本流程用月合成（缺月用相邻月填补），按 /10000 缩放以对齐预训练权重。
+`test_report.json` / `cv_report.json` 里的 `confmat_summary` 就是按官方方式从混淆矩阵算出的
+OA 和 mIoU（mIoU = 各类 TP/(TP+FP+FN) 的平均）。
+
+PASTIS 的类别很不均衡（草地和小麦占大多数），建议开 `--class-weights`，主要看 mIoU。
 
 ## 8. 下一步
 

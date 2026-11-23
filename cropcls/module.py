@@ -14,6 +14,7 @@ from torchmetrics.classification import (
     MulticlassAccuracy,
     MulticlassConfusionMatrix,
     MulticlassF1Score,
+    MulticlassJaccardIndex,
 )
 
 from .bands import S2_ALL_BANDS
@@ -69,6 +70,7 @@ class CropClassifier(L.LightningModule):
                 "acc": MulticlassAccuracy(num_classes, average="micro"),
                 "bal_acc": MulticlassAccuracy(num_classes, average="macro"),
                 "f1": MulticlassF1Score(num_classes, average="macro"),
+                "miou": MulticlassJaccardIndex(num_classes, average="macro"),
             }, prefix=prefix)
 
         self.train_metrics = metrics("train/")

@@ -1,11 +1,11 @@
 """Convert PASTIS (France, Sentinel-2 time series, 18 crop types) into per-parcel patches.
 
 PASTIS ships 2,433 tiles of 128x128 px (10 m), each a Sentinel-2 L2A time series of
-~40-70 dates with semantic + instance (parcel) labels. This script cuts one small patch
+38-61 dates (2018-09 .. 2019-10) with semantic + instance (parcel) labels. This script cuts one small patch
 around every labelled parcel and writes it as a GeoTIFF into the folder layout that
 ``cropcls.train --dataset folder`` reads::
 
-    <out>/{train,val,test}/<crop>/<patch>_<parcel>.tif
+    <out>/fold{1..5}/<crop>/<patch>_<parcel>.tif
     <out>/cropcls_meta.json        # bands, timesteps, dates -> picked up by train.py
 
 Two composite modes:
@@ -16,8 +16,11 @@ Two composite modes:
   (months x 10 bands). Use with ``--timesteps`` / the temporal model; phenology is
   what separates e.g. winter wheat from winter barley.
 
-Folds follow the official PASTIS 5-fold split (spatially disjoint): by default folds
-1-3 train, 4 val, 5 test.
+Parcels are stored per official PASTIS fold (spatially disjoint). ``train.py --cv-fold k``
+picks the official rotation k (k=1: train 1,2,3 / val 4 / test 5), and ``cropcls.cv``
+runs all 5 and pools the test confusion matrices, which is how the benchmark reports
+parcel classification (PASTIS-R paper, Table 1: S2 PSE+LTAE OA 91.7 / mIoU 73.9).
+Like the benchmark, background (0) and void (19) are excluded, leaving 18 crop classes.
 
 Download PASTIS (S2 only, ~29 GB) from https://zenodo.org/records/5012942 and unzip,
 then::
@@ -151,15 +154,14 @@ def main(argv: list[str] | None = None) -> dict:
     p.add_argument("--root", required=True, help="unzipped PASTIS directory")
     p.add_argument("--out", default="data/pastis_parcels")
     p.add_argument("--composite", default="monthly", choices=["median", "monthly"])
-    p.add_argument("--start", default="2019-03-01", help="first day of the season (YYYY-MM-DD)")
-    p.add_argument("--end", default="2019-10-31", help="last day of the season")
+    p.add_argument("--start", default="2018-09-01",
+                   help="first day (YYYY-MM-DD); default covers the full PASTIS series so "
+                        "autumn sowing of winter crops is seen")
+    p.add_argument("--end", default="2019-10-31", help="last day")
     p.add_argument("--patch-size", type=int, default=32, help="pixels (10 m) around each parcel")
     p.add_argument("--min-pixels", type=int, default=20, help="skip parcels smaller than this")
     p.add_argument("--mask-outside", action=argparse.BooleanOptionalAction, default=True,
                    help="zero pixels outside the parcel (default on)")
-    p.add_argument("--train-folds", default="1,2,3")
-    p.add_argument("--val-folds", default="4")
-    p.add_argument("--test-folds", default="5")
     p.add_argument("--limit-patches", type=int, default=None, help="debug: first N tiles only")
     args = p.parse_args(argv)
 
@@ -170,23 +172,15 @@ def main(argv: list[str] | None = None) -> dict:
         windows = [(start, date.fromordinal(end.toordinal() + 1))]
     else:
         windows = month_windows(start, end)
-    split_of = {}
-    for split, folds in (("train", args.train_folds), ("val", args.val_folds),
-                         ("test", args.test_folds)):
-        for f in folds.split(","):
-            if f.strip():
-                split_of[int(f)] = split
 
     meta = read_metadata(root)
     if args.limit_patches:
         meta = meta[: args.limit_patches]
-    counts: dict[str, Counter] = {"train": Counter(), "val": Counter(), "test": Counter()}
+    counts: dict[str, Counter] = {f"fold{f}": Counter() for f in range(1, 6)}
     size = args.patch_size
     missing = 0
     for n, m in enumerate(meta, 1):
-        split = split_of.get(m["fold"])
-        if split is None:
-            continue
+        split = f"fold{m['fold']}"
         pid = m["id"]
         if not (root / "DATA_S2" / f"S2_{pid}.npy").exists():
             missing += 1
@@ -221,6 +215,8 @@ def main(argv: list[str] | None = None) -> dict:
         print(f"warning: {missing} tiles listed in metadata.geojson had no S2 file (skipped)")
     info = {
         "source": "PASTIS",
+        "layout": "folds",
+        "classes": [c for i, c in enumerate(PASTIS_CLASSES) if i not in IGNORE_LABELS],
         "file_bands": list(PASTIS_S2_BANDS),
         "timesteps": len(windows),
         "windows": [[a.isoformat(), b.isoformat()] for a, b in windows],

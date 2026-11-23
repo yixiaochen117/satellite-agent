@@ -38,6 +38,16 @@ EUROSAT_CLASSES = (
     "Pasture", "PermanentCrop", "Residential", "River", "SeaLake",
 )
 
+# Official PASTIS cross-validation rotation (train folds, val fold, test fold), as in
+# github.com/VSainteuf/utae-paps train_semantic.py
+PASTIS_FOLD_SEQUENCE = (
+    ((1, 2, 3), (4,), (5,)),
+    ((2, 3, 4), (5,), (1,)),
+    ((3, 4, 5), (1,), (2,)),
+    ((4, 5, 1), (2,), (3,)),
+    ((5, 1, 2), (3,), (4,)),
+)
+
 # Classes most relevant for agriculture; handy with --classes agri
 EUROSAT_AGRI_CLASSES = ("AnnualCrop", "PermanentCrop", "Pasture", "HerbaceousVegetation")
 
@@ -87,8 +97,8 @@ def _list_tifs(d: Path) -> list[Path]:
     return sorted(p for p in d.rglob("*") if p.suffix.lower() in TIF_SUFFIXES)
 
 
-def scan_folder(root: str | os.PathLike, classes: Sequence[str] | None = None
-                ) -> tuple[list[str], list[tuple[Path, int]]]:
+def scan_folder(root: str | os.PathLike, classes: Sequence[str] | None = None,
+                allow_empty: bool = False) -> tuple[list[str], list[tuple[Path, int]]]:
     """Scan ``<root>/<class>/*.tif`` into a sorted class list and (path, label) pairs."""
     root = Path(root)
     classes = list(classes) if classes else _list_class_dirs(root)
@@ -98,7 +108,7 @@ def scan_folder(root: str | os.PathLike, classes: Sequence[str] | None = None
         if not d.is_dir():
             continue
         samples += [(p, label) for p in _list_tifs(d)]
-    if not samples:
+    if not samples and not allow_empty:
         raise FileNotFoundError(f"No .tif files found under {root}/<class>/")
     return classes, samples
 
@@ -218,6 +228,7 @@ class CropDataModule(L.LightningDataModule):
         patch_size: int = 64,
         scale_to_dn: float = 1.0,
         timesteps: int = 1,
+        cv_fold: int = 1,
         val_frac: float = 0.15,
         test_frac: float = 0.15,
         batch_size: int = 128,
@@ -234,6 +245,9 @@ class CropDataModule(L.LightningDataModule):
         self.patch_size = patch_size
         self.scale_to_dn = scale_to_dn
         self.timesteps = timesteps
+        if not 1 <= cv_fold <= 5:
+            raise ValueError("cv_fold must be in 1..5")
+        self.cv_fold = cv_fold
         self.val_frac, self.test_frac = val_frac, test_frac
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -255,7 +269,24 @@ class CropDataModule(L.LightningDataModule):
             kw = dict(file_bands=self.file_bands, bands=self.bands,
                       patch_size=self.patch_size, scale_to_dn=self.scale_to_dn,
                       timesteps=self.timesteps)
-            if (root / "train").is_dir():
+            if (root / "fold1").is_dir():
+                tr, va, te = PASTIS_FOLD_SEQUENCE[self.cv_fold - 1]
+                classes = read_folder_meta(root).get("classes") or sorted(
+                    {c for f in range(1, 6) if (root / f"fold{f}").is_dir()
+                     for c in _list_class_dirs(root / f"fold{f}")})
+
+                def gather(folds: Sequence[int]) -> list[tuple[Path, int]]:
+                    out: list[tuple[Path, int]] = []
+                    for f in folds:
+                        d = root / f"fold{f}"
+                        if d.is_dir():
+                            out += scan_folder(d, classes, allow_empty=True)[1]
+                    return out
+
+                parts = {"train": gather(tr), "val": gather(va), "test": gather(te)}
+                if not parts["train"]:
+                    raise FileNotFoundError(f"no training parcels in folds {tr} under {root}")
+            elif (root / "train").is_dir():
                 classes, train = scan_folder(root / "train")
                 parts = {"train": train}
                 for split in ("val", "test"):
@@ -295,6 +326,7 @@ class CropDataModule(L.LightningDataModule):
             "dataset": self.dataset,
             "bands": list(self.bands),
             "timesteps": self.timesteps,
+            "cv_fold": self.cv_fold,
             "classes": self.classes,
             "sizes": {k: len(v) for k, v in self.splits.items()},
             "train_class_counts": dict(zip(self.classes, self.class_counts())),

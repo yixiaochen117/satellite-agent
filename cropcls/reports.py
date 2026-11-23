@@ -10,6 +10,18 @@ from pathlib import Path
 import torch
 
 
+def confmat_summary(cm: torch.Tensor) -> dict:
+    """OA and mIoU straight from the confusion matrix, as the PASTIS benchmark computes them
+    (classes absent from both truth and prediction are skipped, like np.nanmean)."""
+    cm = cm.double()
+    tp = cm.diag()
+    denom = cm.sum(0) + cm.sum(1) - tp
+    iou = tp[denom > 0] / denom[denom > 0]
+    return {"OA": (tp.sum() / cm.sum().clamp(min=1)).item(),
+            "mIoU": iou.mean().item() if iou.numel() else float("nan"),
+            "n": int(cm.sum().item())}
+
+
 def write_reports(out_dir: str | Path, classes: Sequence[str], metrics: dict,
                   per_class_acc: torch.Tensor, confmat: torch.Tensor) -> dict:
     out = Path(out_dir)
@@ -25,9 +37,12 @@ def write_reports(out_dir: str | Path, classes: Sequence[str], metrics: dict,
         f1 = (2 * precision * recall / (precision + recall)
               if precision == precision and recall == recall and precision + recall > 0
               else float("nan"))
-        per_class[name] = {"precision": precision, "recall": recall, "f1": f1,
+        denom = (support[i] + predicted[i] - tp[i]).item()
+        iou = tp[i].item() / denom if denom else float("nan")
+        per_class[name] = {"precision": precision, "recall": recall, "f1": f1, "iou": iou,
                            "support": int(support[i])}
-    report = {"metrics": {k: float(v) for k, v in metrics.items()}, "per_class": per_class}
+    report = {"metrics": {k: float(v) for k, v in metrics.items()},
+              "confmat_summary": confmat_summary(cm), "per_class": per_class}
     (out / "test_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
 
     with open(out / "confusion_matrix.csv", "w", newline="") as f:
@@ -72,8 +87,11 @@ def print_report(report: dict) -> None:
     print("\n== Test metrics ==")
     for k, v in m.items():
         print(f"  {k:16s} {v:.4f}")
-    print("\n  {:24s} {:>9s} {:>7s} {:>7s} {:>8s}".format("class", "precision", "recall",
-                                                       "f1", "support"))
+    c = report.get("confmat_summary")
+    if c:
+        print(f"  {'OA (confmat)':16s} {c['OA']:.4f}\n  {'mIoU (confmat)':16s} {c['mIoU']:.4f}")
+    print("\n  {:26s} {:>9s} {:>7s} {:>7s} {:>7s} {:>8s}".format(
+        "class", "precision", "recall", "f1", "iou", "support"))
     for name, r in report["per_class"].items():
-        print(f"  {name:24s} {r['precision']:9.3f} {r['recall']:7.3f} {r['f1']:7.3f} "
-              f"{r['support']:8d}")
+        print(f"  {name:26s} {r['precision']:9.3f} {r['recall']:7.3f} {r['f1']:7.3f} "
+              f"{r['iou']:7.3f} {r['support']:8d}")

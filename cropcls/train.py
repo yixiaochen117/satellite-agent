@@ -62,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[folder] patches resized to this (default: cropcls_meta.json, else 64)")
     d.add_argument("--classes", nargs="+", default=None,
                    help="keep only these classes ('agri' = EuroSAT crop-related classes)")
+    d.add_argument("--cv-fold", type=int, default=1, choices=[1, 2, 3, 4, 5],
+                   help="[folder with fold1..fold5, e.g. PASTIS] official CV rotation: "
+                        "1 = train 1,2,3 / val 4 / test 5; 2 = train 2,3,4 / val 5 / test 1; ...")
     d.add_argument("--val-frac", type=float, default=0.15)
     d.add_argument("--test-frac", type=float, default=0.15)
     d.add_argument("--batch-size", type=int, default=128)
@@ -131,7 +134,7 @@ def main(argv: list[str] | None = None) -> dict:
     dm = CropDataModule(
         dataset=args.dataset, data_root=data_root, bands=bands, classes=args.classes,
         file_bands=file_bands, patch_size=args.patch_size, scale_to_dn=args.scale_to_dn,
-        timesteps=args.timesteps, val_frac=args.val_frac, test_frac=args.test_frac, batch_size=args.batch_size,
+        timesteps=args.timesteps, cv_fold=args.cv_fold, val_frac=args.val_frac, test_frac=args.test_frac, batch_size=args.batch_size,
         num_workers=args.num_workers, seed=args.seed, download=args.download,
     )
     classes = dm.classes

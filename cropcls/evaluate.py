@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> dict:
         bands=tuple(hp.bands), classes=run.get("classes"),
         file_bands=parse_bands(run["file_bands"]) if run.get("file_bands") else None,
         patch_size=run.get("patch_size") or 64, scale_to_dn=run.get("scale_to_dn", 1.0),
-        timesteps=int(hp.get("timesteps", 1)),
+        timesteps=int(hp.get("timesteps", 1)), cv_fold=int(run.get("cv_fold", 1)),
         val_frac=run.get("val_frac", 0.15), test_frac=run.get("test_frac", 0.15),
         seed=run.get("seed", 42), batch_size=args.batch_size, num_workers=args.num_workers,
     )

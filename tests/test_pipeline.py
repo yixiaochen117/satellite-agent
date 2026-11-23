@@ -112,7 +112,7 @@ def _write_fake_pastis(root, n_patches=5, size=64, n_dates=12):
                                                          "features": feats}))
 
 
-@pytest.mark.parametrize("mode,timesteps", [("median", 1), ("monthly", 8)])
+@pytest.mark.parametrize("mode,timesteps", [("median", 1), ("monthly", 14)])
 def test_pastis_convert_and_train(tmp_path, mode, timesteps):
     from cropcls.prepare_pastis import main as prep
     from cropcls.train import main as train
@@ -121,14 +121,43 @@ def test_pastis_convert_and_train(tmp_path, mode, timesteps):
     info = prep(["--root", str(tmp_path), "--out", str(tmp_path / "parcels"),
                  "--composite", mode, "--patch-size", "24"])
     assert info["timesteps"] == timesteps
-    # 4 valid parcels per tile; folds 1-3 train, 4 val, 5 test
-    assert sum(info["counts"]["train"].values()) == 12
-    assert sum(info["counts"]["test"].values()) == 4
-    assert "void_label" not in info["counts"]["train"]
+    assert len(info["classes"]) == 18
+    # 4 valid parcels per tile, one tile per fold; tiny and void parcels dropped
+    for f in range(1, 6):
+        assert sum(info["counts"][f"fold{f}"].values()) == 4
+    assert "void_label" not in info["counts"]["fold1"]
 
     report = train(["--dataset", "folder", "--data-root", str(tmp_path / "parcels"),
-                    "--weights", "none", "--epochs", "2", "--freeze-epochs", "1",
-                    "--batch-size", "4", "--num-workers", "0", "--img-size", "32",
-                    "--out-dir", str(tmp_path / "runs"), "--name", "p",
+                    "--cv-fold", "2", "--weights", "none", "--epochs", "2",
+                    "--freeze-epochs", "1", "--batch-size", "4", "--num-workers", "0",
+                    "--img-size", "32", "--out-dir", str(tmp_path / "runs"), "--name", "p",
                     "--accelerator", "cpu"])
-    assert len(report["per_class"]) == 4
+    assert len(report["per_class"]) == 18
+    assert report["confmat_summary"]["n"] == 4  # rotation 2 tests on fold 1
+    assert 0.0 <= report["confmat_summary"]["mIoU"] <= 1.0
+
+
+def test_pastis_cv_pools_folds(tmp_path):
+    from cropcls.cv import main as cv
+    from cropcls.prepare_pastis import main as prep
+
+    _write_fake_pastis(tmp_path / "PASTIS")
+    prep(["--root", str(tmp_path), "--out", str(tmp_path / "parcels"),
+          "--composite", "median", "--patch-size", "24"])
+    report = cv(["--data-root", str(tmp_path / "parcels"), "--name", "cv",
+                 "--out-dir", str(tmp_path / "runs"), "--",
+                 "--weights", "none", "--epochs", "1", "--freeze-epochs", "0",
+                 "--batch-size", "4", "--num-workers", "0", "--img-size", "32",
+                 "--accelerator", "cpu"])
+    assert report["confmat_summary"]["n"] == 20  # every parcel tested exactly once
+    assert set(report["per_fold"]) == {1, 2, 3, 4, 5}
+
+
+def test_confmat_summary_matches_definition():
+    from cropcls.reports import confmat_summary
+
+    cm = torch.tensor([[5, 1, 0], [2, 2, 0], [0, 0, 0]])
+    s = confmat_summary(cm)
+    assert abs(s["OA"] - 7 / 10) < 1e-9
+    # class 2 absent from truth and prediction -> skipped
+    assert abs(s["mIoU"] - ((5 / 8) + (2 / 5)) / 2) < 1e-9
