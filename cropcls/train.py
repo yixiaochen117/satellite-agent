@@ -8,6 +8,10 @@ Examples::
     # Only the agricultural EuroSAT classes
     python -m cropcls.train --dataset eurosat --classes agri
 
+    # PASTIS (France, 18 crop types) after `python -m cropcls.prepare_pastis`,
+    # monthly time series -> temporal model (bands/timesteps read from cropcls_meta.json)
+    python -m cropcls.train --dataset folder --data-root data/pastis_parcels --class-weights
+
     # Your own labelled patches: data/mycrops/<class>/*.tif with 12 L2A bands
     python -m cropcls.train --dataset folder --data-root data/mycrops \
         --file-bands l2a --bands l2a --class-weights
@@ -30,7 +34,7 @@ from lightning.pytorch.callbacks import (
 from lightning.pytorch.loggers import CSVLogger
 
 from .bands import parse_bands
-from .data import CropDataModule, save_summary
+from .data import CropDataModule, read_folder_meta, save_summary
 from .model import ARCHS
 from .module import CropClassifier
 from .reports import print_report, write_reports
@@ -47,10 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--bands", default="all",
                    help="bands fed to the model: all | l2a | rgb | comma list (e.g. B02,B03,B04,B08)")
     d.add_argument("--file-bands", default=None,
-                   help="[folder] bands stored in each GeoTIFF, in file order (default = --bands)")
+                   help="[folder] bands stored in each GeoTIFF, in file order "
+                        "(default: cropcls_meta.json, else = --bands)")
+    d.add_argument("--timesteps", type=int, default=None,
+                   help="[folder] dates stacked per file; >1 uses the temporal model "
+                        "(default: cropcls_meta.json, else 1)")
     d.add_argument("--scale-to-dn", type=float, default=1.0,
                    help="[folder] multiply file values by this; use 10000 if files hold 0-1 reflectance")
-    d.add_argument("--patch-size", type=int, default=64, help="[folder] patches resized to this")
+    d.add_argument("--patch-size", type=int, default=None,
+                   help="[folder] patches resized to this (default: cropcls_meta.json, else 64)")
     d.add_argument("--classes", nargs="+", default=None,
                    help="keep only these classes ('agri' = EuroSAT crop-related classes)")
     d.add_argument("--val-frac", type=float, default=0.15)
@@ -62,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--arch", default="resnet18", choices=ARCHS)
     m.add_argument("--weights", default="SENTINEL2_ALL_MOCO",
                    help="TorchGeo weight name (SENTINEL2_ALL_MOCO, SENTINEL2_ALL_DINO, ...) or 'none'")
-    m.add_argument("--img-size", type=int, default=224,
-                   help="input size on GPU; 224 matches pretraining, 128 is ~3x faster")
+    m.add_argument("--img-size", type=int, default=None,
+                   help="input size on GPU (default 224 = pretraining size; 64 for time series)")
     m.add_argument("--drop-rate", type=float, default=0.2)
 
     o = p.add_argument_group("optimisation")
@@ -100,15 +109,29 @@ def main(argv: list[str] | None = None) -> dict:
     L.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
 
+    data_root = args.data_root or f"data/{args.dataset}"
+    meta = read_folder_meta(data_root) if args.dataset == "folder" else {}
+    if meta:
+        print(f"using {data_root}/cropcls_meta.json: file_bands={meta.get('file_bands')} "
+              f"timesteps={meta.get('timesteps')}")
+    if args.file_bands is None and meta.get("file_bands"):
+        args.file_bands = ",".join(meta["file_bands"])
+    if args.bands == "all" and meta.get("file_bands"):
+        args.bands = args.file_bands  # default: use every band the files have
+    if args.timesteps is None:
+        args.timesteps = int(meta.get("timesteps", 1))
+    if args.patch_size is None:
+        args.patch_size = int(meta.get("patch_size", 64))
+    if args.img_size is None:
+        args.img_size = 224 if args.timesteps == 1 else 64
     bands = parse_bands(args.bands)
     file_bands = parse_bands(args.file_bands) if args.file_bands else None
-    data_root = args.data_root or f"data/{args.dataset}"
     weights = None if str(args.weights).lower() == "none" else args.weights
 
     dm = CropDataModule(
         dataset=args.dataset, data_root=data_root, bands=bands, classes=args.classes,
         file_bands=file_bands, patch_size=args.patch_size, scale_to_dn=args.scale_to_dn,
-        val_frac=args.val_frac, test_frac=args.test_frac, batch_size=args.batch_size,
+        timesteps=args.timesteps, val_frac=args.val_frac, test_frac=args.test_frac, batch_size=args.batch_size,
         num_workers=args.num_workers, seed=args.seed, download=args.download,
     )
     classes = dm.classes
@@ -131,7 +154,7 @@ def main(argv: list[str] | None = None) -> dict:
         backbone_lr_mult=args.backbone_lr_mult, weight_decay=args.weight_decay,
         freeze_epochs=args.freeze_epochs, warmup_epochs=args.warmup_epochs,
         label_smoothing=args.label_smoothing, drop_rate=args.drop_rate,
-        class_weights=class_weights,
+        class_weights=class_weights, timesteps=args.timesteps,
     )
     if args.compile:
         model.model.compile()  # in-place: keeps checkpoint keys unchanged

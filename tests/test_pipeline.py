@@ -81,3 +81,54 @@ def test_train_end_to_end(tmp_path):
                    "--accelerator", "cpu"])
     assert set(report["per_class"]) == {"maize", "rice", "wheat"}
     assert (tmp_path / "runs" / "t" / "confusion_matrix.csv").exists()
+
+
+def _write_fake_pastis(root, n_patches=5, size=64, n_dates=12):
+    import json as _json
+
+    rng = np.random.default_rng(1)
+    for d in ("DATA_S2", "ANNOTATIONS", "INSTANCE_ANNOTATIONS"):
+        (root / d).mkdir(parents=True)
+    feats = []
+    for pid in range(10, 10 + n_patches):
+        # 4 square parcels per tile with labels 1..4, one tiny parcel, one void parcel
+        inst = np.zeros((size, size), dtype=np.int64)
+        sem = np.zeros((size, size), dtype=np.uint8)
+        for k, (y, x) in enumerate([(4, 4), (4, 36), (36, 4), (36, 36)]):
+            inst[y:y + 20, x:x + 20] = k + 1
+            sem[y:y + 20, x:x + 20] = k + 1
+        inst[0:2, 60:62], sem[0:2, 60:62] = 9, 1       # too small
+        inst[60:64, 0:10], sem[60:64, 0:10] = 8, 19    # void
+        s2 = (rng.random((n_dates, 10, size, size)) * 500
+              + sem[None, None].astype(np.float32) * 300).astype(np.int16)
+        np.save(root / "DATA_S2" / f"S2_{pid}.npy", s2)
+        np.save(root / "ANNOTATIONS" / f"TARGET_{pid}.npy", np.stack([sem] * 3))
+        np.save(root / "INSTANCE_ANNOTATIONS" / f"INSTANCES_{pid}.npy", inst)
+        dates = {str(i): int(f"2019{(i % 12) + 1:02d}15") for i in range(n_dates)}
+        feats.append({"type": "Feature", "geometry": None,
+                      "properties": {"ID_PATCH": pid, "Fold": pid - 9,
+                                     "dates-S2": dates}})
+    (root / "metadata.geojson").write_text(_json.dumps({"type": "FeatureCollection",
+                                                         "features": feats}))
+
+
+@pytest.mark.parametrize("mode,timesteps", [("median", 1), ("monthly", 8)])
+def test_pastis_convert_and_train(tmp_path, mode, timesteps):
+    from cropcls.prepare_pastis import main as prep
+    from cropcls.train import main as train
+
+    _write_fake_pastis(tmp_path / "PASTIS")
+    info = prep(["--root", str(tmp_path), "--out", str(tmp_path / "parcels"),
+                 "--composite", mode, "--patch-size", "24"])
+    assert info["timesteps"] == timesteps
+    # 4 valid parcels per tile; folds 1-3 train, 4 val, 5 test
+    assert sum(info["counts"]["train"].values()) == 12
+    assert sum(info["counts"]["test"].values()) == 4
+    assert "void_label" not in info["counts"]["train"]
+
+    report = train(["--dataset", "folder", "--data-root", str(tmp_path / "parcels"),
+                    "--weights", "none", "--epochs", "2", "--freeze-epochs", "1",
+                    "--batch-size", "4", "--num-workers", "0", "--img-size", "32",
+                    "--out-dir", str(tmp_path / "runs"), "--name", "p",
+                    "--accelerator", "cpu"])
+    assert len(report["per_class"]) == 4

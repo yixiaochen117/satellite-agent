@@ -8,12 +8,13 @@
 cropcls/
   bands.py     Sentinel-2 波段名与顺序（与预训练权重对齐）
   data.py      EuroSAT / 自有 GeoTIFF 目录数据集 + DataModule
-  model.py     TorchGeo ResNet + 波段子集时自动裁剪第一层卷积
+  model.py     TorchGeo ResNet（波段子集自动裁剪第一层卷积）+ 时序 Transformer 头
   module.py    LightningModule：GPU 上做缩放/增强/resize，冻结→解冻调度
   train.py     训练入口（训练完自动在 test 集评估并写报告）
   evaluate.py  对任意 checkpoint 重新评估
   predict.py   对一批 GeoTIFF 输出预测 CSV
   download.py  预下载数据集与权重
+  prepare_pastis.py  PASTIS（法国作物类型）→ 地块 patch
 tests/         合成数据的快速 CPU 测试
 ```
 
@@ -132,11 +133,41 @@ python -m cropcls.predict  runs/<name>/checkpoints/best-XX.ckpt path/to/tifs \
 pytest -q    # 合成 GeoTIFF，CPU 上几秒跑完，不需要下载
 ```
 
-## 7. 下一步
+## 7. 欧洲作物类型：PASTIS（法国，18 种作物）
 
-- **真正的作物类型数据**：EuroSAT 只有粗粒度的“耕地/园地/草地”。要区分玉米、水稻、小麦等，
-  需要作物类型标签，例如 TorchGeo 里的 PASTIS（法国，Sentinel-2 时序）、
-  South Africa Crop Type、AgriFieldNet（印度），或用自己地区的样点 + GEE 导出 patch，
-  直接走上面的 `folder` 流程。
-- **多时相 / 物候**：作物类型靠时序区分效果最好。可以在本流程上把每个时相的特征
-  用 ResNet 提取后接轻量 Transformer，或换 Prithvi-EO-2.0-tiny（TerraTorch）做多时相微调。
+[PASTIS](https://github.com/VSainteuf/pastis-benchmark) 是法国 4 个 Sentinel-2 瓦片上的
+2,433 个 128×128 时序块（2018-09 到 2019-11，每块 33–61 个日期，L2A 10 波段），
+约 12.4 万个地块有作物类型标签：草地、软冬小麦、玉米、冬大麦、冬油菜、春大麦、向日葵、
+葡萄、甜菜、冬黑小麦、冬硬粒小麦、果蔬花卉、马铃薯、豆科饲草、大豆、果园、混合谷物、高粱。
+官方 5 折是空间上分开的，默认 fold 1–3 训练、4 验证、5 测试。
+
+```bash
+# 1) 下载并解压 PASTIS（只要 S2 部分，约 29 GB）
+#    https://zenodo.org/records/5012942  ->  data/PASTIS/
+# 2) 每个地块切一个 32×32（320 m）的 patch，地块外像素置 0
+python -m cropcls.prepare_pastis --root data/PASTIS --out data/pastis_parcels --composite monthly
+# 3) 训练（波段、时间步数自动从 data/pastis_parcels/cropcls_meta.json 读取）
+python -m cropcls.train --dataset folder --data-root data/pastis_parcels --class-weights --name pastis-monthly
+```
+
+两种合成方式：
+
+| `--composite` | 输出 | 模型 |
+|---|---|---|
+| `monthly`（默认） | 2019-03 到 2019-10 每月一个中值合成，8 个时间步 × 10 波段 | 时序模型：每个时间步共享同一个 ResNet-18（预训练权重），再接 2 层小 Transformer 做时间聚合，共约 12.4M 参数 |
+| `median` | 整个生长季一个中值合成，10 波段 | 普通 ResNet-18 |
+
+作物类型主要靠物候区分（冬小麦和冬大麦单看一景几乎一样），所以优先用 `monthly`。
+时间范围用 `--start/--end` 调整，地块 patch 大小用 `--patch-size`，
+`--no-mask-outside` 可以保留地块周边像素。时序模型默认 `--img-size 64`，
+在 5070 上 `--batch-size 64` 显存很宽裕，可以往上加。
+
+PASTIS 的类别很不均衡（草地和小麦占大多数），建议开 `--class-weights`，
+并以 test 集 macro-F1 / 平衡精度为主要指标，而不是总体精度。
+
+## 8. 下一步
+
+- **其它欧洲地区**：EuroCrops 提供了多个欧盟国家的地块矢量和统一作物编码（HCAT），
+  但不带影像。可以用 GEE 按地块导出 Sentinel-2 月合成，写成同样的
+  `<split>/<crop>/*.tif` + `cropcls_meta.json`，直接复用上面的训练流程。
+- **更强的时序基础模型**：Prithvi-EO-2.0-tiny（TerraTorch）原生支持多时相 HLS 输入。

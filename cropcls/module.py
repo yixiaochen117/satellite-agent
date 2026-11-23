@@ -55,10 +55,11 @@ class CropClassifier(L.LightningModule):
         label_smoothing: float = 0.1,
         drop_rate: float = 0.2,
         class_weights: Sequence[float] | None = None,
+        timesteps: int = 1,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-        self.model = build_model(num_classes, bands, arch, weights, drop_rate)
+        self.model = build_model(num_classes, bands, arch, weights, drop_rate, timesteps)
         self.model = self.model.to(memory_format=torch.channels_last)
         cw = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
         self.register_buffer("class_weights", cw, persistent=False)
@@ -85,6 +86,8 @@ class CropClassifier(L.LightningModule):
         s = self.hparams.img_size
         if x.shape[-2:] != (s, s):
             x = F.interpolate(x, size=(s, s), mode="bilinear", align_corners=False)
+        if self.hparams.timesteps > 1:
+            return x  # TemporalResNet reshapes per date and sets the memory format
         return x.contiguous(memory_format=torch.channels_last)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

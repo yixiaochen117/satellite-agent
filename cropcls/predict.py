@@ -53,7 +53,8 @@ def main(argv: list[str] | None = None) -> None:
     file_bands = parse_bands(args.file_bands) if args.file_bands else bands
 
     ds = GeoTiffFolderDataset([(f, -1) for f in files], classes, file_bands, bands,
-                              args.patch_size, args.scale_to_dn)
+                              args.patch_size, args.scale_to_dn,
+                              timesteps=int(model.hparams.get("timesteps", 1)))
     dl = DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers)
     k = min(args.top_k, len(classes))
     rows = []

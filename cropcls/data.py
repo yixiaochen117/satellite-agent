@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import warnings
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -134,19 +135,23 @@ class GeoTiffFolderDataset(Dataset):
         patch_size: every patch is resized to this size so they can be batched.
         scale_to_dn: multiply file values by this (e.g. 10000 if your files hold
             0-1 reflectance) so they match the 0-10000 range the weights expect.
+        timesteps: number of dates stacked in each file (time-major: all bands of
+            date 1, then date 2, ...). The sample is returned as ``(T*C, H, W)``.
     """
 
     def __init__(self, samples: list[tuple[Path, int]], classes: Sequence[str],
                  file_bands: Sequence[str], bands: Sequence[str], patch_size: int = 64,
-                 scale_to_dn: float = 1.0) -> None:
+                 scale_to_dn: float = 1.0, timesteps: int = 1) -> None:
         missing = [b for b in bands if b not in file_bands]
         if missing:
             raise ValueError(f"Bands {missing} requested but files only have {list(file_bands)}")
         self.samples = samples
         self.classes = list(classes)
         self.targets = [s[1] for s in samples]
-        self.index = [list(file_bands).index(b) for b in bands]
-        self.n_file_bands = len(file_bands)
+        per_t = [list(file_bands).index(b) for b in bands]
+        nfb = len(file_bands)
+        self.index = [t * nfb + i for t in range(timesteps) for i in per_t]
+        self.n_file_bands = nfb * timesteps
         self.patch_size = patch_size
         self.scale_to_dn = scale_to_dn
 
@@ -157,10 +162,13 @@ class GeoTiffFolderDataset(Dataset):
         import rasterio
 
         path, label = self.samples[idx]
-        with rasterio.open(path) as f:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
+            f = rasterio.open(path)
+        with f:
             if f.count != self.n_file_bands:
                 raise ValueError(f"{path} has {f.count} bands, expected {self.n_file_bands} "
-                                 "(set --file-bands to match your files)")
+                                 "(set --file-bands / --timesteps to match your files)")
             arr = f.read(indexes=[i + 1 for i in self.index]).astype(np.float32)
         x = torch.from_numpy(arr)
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) * self.scale_to_dn
@@ -209,6 +217,7 @@ class CropDataModule(L.LightningDataModule):
         file_bands: Sequence[str] | None = None,
         patch_size: int = 64,
         scale_to_dn: float = 1.0,
+        timesteps: int = 1,
         val_frac: float = 0.15,
         test_frac: float = 0.15,
         batch_size: int = 128,
@@ -224,6 +233,7 @@ class CropDataModule(L.LightningDataModule):
         self.file_bands = tuple(file_bands) if file_bands else self.bands
         self.patch_size = patch_size
         self.scale_to_dn = scale_to_dn
+        self.timesteps = timesteps
         self.val_frac, self.test_frac = val_frac, test_frac
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -243,7 +253,8 @@ class CropDataModule(L.LightningDataModule):
         elif self.dataset == "folder":
             root = Path(self.data_root)
             kw = dict(file_bands=self.file_bands, bands=self.bands,
-                      patch_size=self.patch_size, scale_to_dn=self.scale_to_dn)
+                      patch_size=self.patch_size, scale_to_dn=self.scale_to_dn,
+                      timesteps=self.timesteps)
             if (root / "train").is_dir():
                 classes, train = scan_folder(root / "train")
                 parts = {"train": train}
@@ -283,6 +294,7 @@ class CropDataModule(L.LightningDataModule):
         return {
             "dataset": self.dataset,
             "bands": list(self.bands),
+            "timesteps": self.timesteps,
             "classes": self.classes,
             "sizes": {k: len(v) for k, v in self.splits.items()},
             "train_class_counts": dict(zip(self.classes, self.class_counts())),
@@ -310,6 +322,12 @@ class CropDataModule(L.LightningDataModule):
 
     def test_dataloader(self) -> DataLoader:
         return self._loader("test", False)
+
+
+def read_folder_meta(root: str | os.PathLike) -> dict:
+    """``cropcls_meta.json`` written by converters such as ``prepare_pastis``."""
+    f = Path(root) / "cropcls_meta.json"
+    return json.loads(f.read_text()) if f.exists() else {}
 
 
 def save_summary(dm: CropDataModule, path: str | os.PathLike) -> None:
